@@ -1,0 +1,3 @@
+
+test:
+	go clean -testcache && CGO_ENABLED=1 go test -race -v ./...

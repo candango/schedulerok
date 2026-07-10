@@ -54,6 +54,8 @@ metrics while exposing the hooks needed for those integrations.
 
 - Go 1.24.6 or later
 
-## License
+## Support
 
-TBD
+schedulerok is one of [Candango Open Source Group
+](http://www.candango.org/projects/) initiatives. It is available under
+the [MIT License](./LICENSE).
