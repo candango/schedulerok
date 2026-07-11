@@ -64,7 +64,7 @@ func (c *fakeClock) Advance(delay time.Duration) {
 	}
 
 	c.timers = pending
-	defer c.mu.Unlock()
+	c.mu.Unlock()
 
 	for _, timer := range ready {
 		timer.fire(timer.due)
@@ -130,5 +130,59 @@ func TestFakeClockFiresTimerAtDueTime(t *testing.T) {
 		assert.Equal(t, want, firedAt)
 	default:
 		t.Fatal("timer did not fire at its due time")
+	}
+}
+
+func TestFakeClockDoesNotFireStoppedTimer(t *testing.T) {
+	start := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(start)
+	timer := clock.NewTimer(10 * time.Second)
+
+	timer.Stop()
+	clock.Advance(10 * time.Second)
+
+	select {
+	case <-timer.Chan():
+		t.Fatal("stopped timer fired")
+	default:
+	}
+}
+
+func TestFakeClockFiresImmediateTimer(t *testing.T) {
+	start := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(start)
+	timer := clock.NewTimer(0)
+
+	select {
+	case firedAt := <-timer.Chan():
+		assert.Equal(t, start, firedAt)
+	default:
+		t.Fatal("immediate timer did not fire")
+	}
+}
+
+func TestFakeClockNowAdvancesWithClock(t *testing.T) {
+	start := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(start)
+
+	clock.Advance(5 * time.Minute)
+
+	assert.Equal(t, start.Add(5*time.Minute), clock.Now())
+}
+
+func TestFakeClockFiresTimerOnlyOnce(t *testing.T) {
+	start := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(start)
+	timer := clock.NewTimer(time.Second)
+
+	clock.Advance(time.Second)
+	<-timer.Chan()
+
+	clock.Advance(time.Second)
+
+	select {
+	case <-timer.Chan():
+		t.Fatal("timer fired more than once")
+	default:
 	}
 }
