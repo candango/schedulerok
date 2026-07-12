@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,10 @@ type registration struct {
 	hooks    Hooks
 	next     time.Time
 	running  atomic.Bool
+	// frozen marks a registration whose Schedule stopped advancing. A frozen
+	// registration is excluded from due consideration and from the central
+	// loop's wake calculation; it stays registered until an explicit Remove.
+	frozen bool
 }
 
 // New creates a Scheduler with production defaults.
@@ -138,6 +143,23 @@ func (s *Scheduler) Remove(id JobID) error {
 	default:
 	}
 	return nil
+}
+
+// FrozenIDs returns the IDs of registrations whose Schedule stopped
+// advancing. A frozen registration stays registered and excluded from due
+// consideration until Remove is called explicitly.
+func (s *Scheduler) FrozenIDs() []JobID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ids []JobID
+	for id, registration := range s.registrations {
+		if registration.frozen {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // AddFunc adapts fn to Job and registers it according to schedule.
@@ -268,10 +290,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			timer.Stop()
 		}
 
-		if err := s.runDue(ctx, now, &jobs); err != nil {
-			jobs.Wait()
-			return err
-		}
+		s.runDue(ctx, now, &jobs)
 	}
 }
 
@@ -281,6 +300,9 @@ func (s *Scheduler) nextRun() (time.Time, bool) {
 
 	var next time.Time
 	for _, registration := range s.registrations {
+		if registration.frozen {
+			continue
+		}
 		if next.IsZero() || registration.next.Before(next) {
 			next = registration.next
 		}
@@ -288,20 +310,25 @@ func (s *Scheduler) nextRun() (time.Time, bool) {
 	return next, !next.IsZero()
 }
 
-func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGroup) error {
+// runDue dispatches every due registration. A registration whose Schedule
+// stops advancing is isolated: it fires OnFailure and freezes in place
+// instead of stopping the scheduler for every other registration.
+func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGroup) {
 	s.mu.Lock()
 	var due []*registration
 	var skipped []*registration
+	var invalid []*registration
 	for _, registration := range s.registrations {
-		if registration.next.After(now) {
+		if registration.frozen || registration.next.After(now) {
 			continue
 		}
 
 		previous := registration.next
 		registration.next = registration.schedule.Next(previous)
 		if !registration.next.After(previous) {
-			s.mu.Unlock()
-			return ErrInvalidSchedule
+			registration.frozen = true
+			invalid = append(invalid, registration)
+			continue
 		}
 
 		if registration.policy.overlap == SkipOverlap &&
@@ -313,6 +340,10 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 	}
 	s.mu.Unlock()
 
+	for _, registration := range invalid {
+		registration.callHook(ctx, registration.hooks.OnFailure,
+			Event{JobID: registration.id, Error: ErrInvalidSchedule})
+	}
 	for _, registration := range skipped {
 		registration.callHook(ctx, registration.hooks.OnSkip, Event{JobID: registration.id})
 	}
@@ -320,7 +351,6 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 		jobs.Add(1)
 		go s.runJob(ctx, registration, jobs)
 	}
-	return nil
 }
 
 func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs *sync.WaitGroup) {

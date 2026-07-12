@@ -266,6 +266,75 @@ func TestSchedulerSkipsOverlappingJob(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestSchedulerFreezesRegistrationInsteadOfStoppingRun(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+
+	var calls atomic.Int32
+	failed := make(chan Event, 1)
+	brokenID, err := scheduler.Add(
+		ScheduleFunc(func(after time.Time) time.Time {
+			if calls.Add(1) == 1 {
+				return after.Add(time.Second)
+			}
+			return after
+		}),
+		JobFunc(func(context.Context) error { return nil }),
+		WithHooks(Hooks{OnFailure: func(_ context.Context, event Event) {
+			failed <- event
+		}}),
+	)
+	require.NoError(t, err)
+
+	ran := make(chan struct{}, 2)
+	_, err = scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		ran <- struct{}{}
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case event := <-failed:
+		assert.Equal(t, brokenID, event.JobID)
+		assert.ErrorIs(t, event.Error, ErrInvalidSchedule)
+	case <-time.After(time.Second):
+		t.Fatal("broken registration did not fire OnFailure")
+	}
+
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("healthy registration did not run alongside the broken one")
+	}
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("healthy registration stopped running after a sibling froze")
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, []JobID{brokenID}, scheduler.FrozenIDs())
+
+	scheduler.mu.Lock()
+	_, exists := scheduler.registrations[brokenID]
+	scheduler.mu.Unlock()
+	require.True(t, exists, "frozen registration must stay registered")
+}
+
 func TestSchedulerRejectsScheduleThatDoesNotAdvance(t *testing.T) {
 	scheduler := New()
 	_, err := scheduler.Add(ScheduleFunc(func(after time.Time) time.Time {
