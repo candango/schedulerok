@@ -23,7 +23,8 @@ func WithClock(clock Clock) Option {
 type RegistrationOption func(*registrationOptions)
 
 type registrationOptions struct {
-	id JobID
+	id     JobID
+	policy executionPolicy
 }
 
 // WithID assigns a stable ID to one registered job.
@@ -37,18 +38,22 @@ func WithID(id JobID) RegistrationOption {
 	}
 }
 
-func registrationID(next uint64, options []RegistrationOption) (JobID, error) {
+func registrationConfig(options []RegistrationOption) (registrationOptions, error) {
 	config := registrationOptions{}
 	for _, option := range options {
 		if option == nil {
-			return "", fmt.Errorf("scheduler: registration option must not be nil")
+			return registrationOptions{}, fmt.Errorf("scheduler: registration option must not be nil")
 		}
 		option(&config)
 	}
 
+	return config, nil
+}
+
+func registrationID(next uint64, config registrationOptions) JobID {
 	if config.id != "" {
-		return config.id, nil
+		return config.id
 	}
 
-	return JobID(fmt.Sprintf("job-%d", next)), nil
+	return JobID(fmt.Sprintf("job-%d", next))
 }

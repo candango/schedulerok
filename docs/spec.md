@@ -92,6 +92,25 @@ Cron parsing remains owned by `intervalok`; a cron convenience method delegates
 to that parser and then calls `Add`. The generic `Add` API remains independent
 of any cron parser.
 
+## Execution policies
+
+Policies are configured per registration:
+
+```go
+scheduler.Add(
+	schedule,
+	job,
+	scheduler.WithTimeout(30*time.Second),
+	scheduler.WithRetry(3, newBackoff),
+	scheduler.WithOverlap(scheduler.SkipOverlap),
+)
+```
+
+`WithTimeout` creates a fresh deadline for each attempt. `WithRetry` receives a
+factory so concurrent scheduled runs never share mutable backoff state. The
+default overlap policy is `AllowOverlap`; `SkipOverlap` discards a due run when
+the previous run is still active.
+
 ## Lifecycle
 
 `Scheduler` is the public coordinator. It owns multiple registered jobs,

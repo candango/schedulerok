@@ -23,9 +23,9 @@ any schedule implementation that satisfies `Schedule`.
 | Scheduler start and cancellation | Available | Available | Available | Scheduler owns the timer loop and reacts to context cancellation. |
 | Graceful shutdown | Available | Available | Available | Stop new scheduling, then wait for active jobs. |
 | Job registry and configuration factories | Backlog | Programmatic jobs | Programmatic jobs | Preserve application-owned configuration and factories. |
-| Timeout policy | Backlog | Available | Available through configuration | Per-job, context-based timeout. |
-| Retry and backoff | Backlog | Available | Available | Explicit policy with deterministic behavior. |
-| Overlap policy | Backlog | Available | Available through configuration | Per-job allow, skip, or queue semantics. |
+| Timeout policy | Available | Available | Available through configuration | Per-job, context-based timeout. |
+| Retry and backoff | Available | Available | Available | Per-registration retry with isolated backoff state. |
+| Overlap policy | Available | Available | Available through configuration | Per-job allow or skip semantics; queue remains future work. |
 | Global concurrency limit | Not planned yet | Available | Available | Add only when real workloads require it. |
 | Pause, resume, remove, and update jobs | Not planned yet | Available | Available | Add after the scheduler API is stable. |
 | Lifecycle hooks | Backlog | Available | Listener-based extensions | Hooks for start, success, failure, skip, and retry. |

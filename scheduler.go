@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,7 +40,9 @@ type Scheduler struct {
 type registration struct {
 	schedule Schedule
 	job      Job
+	policy   executionPolicy
 	next     time.Time
+	running  atomic.Bool
 }
 
 // New creates a Scheduler with production defaults.
@@ -75,11 +78,13 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 		return "", ErrSchedulerStarted
 	}
 
-	s.nextID++
-	id, err := registrationID(s.nextID, options)
+	config, err := registrationConfig(options)
 	if err != nil {
 		return "", err
 	}
+
+	s.nextID++
+	id := registrationID(s.nextID, config)
 	if _, exists := s.registrations[id]; exists {
 		return "", fmt.Errorf("scheduler: job ID %q already exists", id)
 	}
@@ -87,6 +92,7 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 	s.registrations[id] = &registration{
 		schedule: schedule,
 		job:      job,
+		policy:   config.policy,
 	}
 	return id, nil
 }
@@ -241,11 +247,69 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 			return ErrInvalidSchedule
 		}
 
+		if registration.policy.overlap == SkipOverlap &&
+			!registration.running.CompareAndSwap(false, true) {
+			continue
+		}
+
 		jobs.Add(1)
-		go func(job Job) {
-			defer jobs.Done()
-			_ = job.Run(ctx)
-		}(registration.job)
+		go s.runJob(ctx, registration, jobs)
 	}
 	return nil
+}
+
+func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs *sync.WaitGroup) {
+	defer jobs.Done()
+	if registration.policy.overlap == SkipOverlap {
+		defer registration.running.Store(false)
+	}
+
+	attempts := registration.policy.retries
+	if attempts == 0 {
+		attempts = 1
+	}
+
+	var backoffStrategy BackoffFactory
+	if registration.policy.retries > 0 {
+		backoffStrategy = registration.policy.backoff
+	}
+	var retryBackoff interface {
+		Next() time.Duration
+	}
+	if backoffStrategy != nil {
+		retryBackoff = backoffStrategy()
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if registration.policy.timeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, registration.policy.timeout)
+		}
+
+		err := registration.job.Run(attemptCtx)
+		cancel()
+		if err == nil || ctx.Err() != nil || attempt == attempts-1 {
+			return
+		}
+
+		if retryBackoff == nil || !s.wait(ctx, retryBackoff.Next()) {
+			return
+		}
+	}
+}
+
+func (s *Scheduler) wait(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+
+	timer := s.clock.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.Chan():
+		return true
+	}
 }

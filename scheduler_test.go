@@ -2,9 +2,12 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/candango/intervalok/backoff"
 	intervalcron "github.com/candango/intervalok/cron"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -114,6 +117,112 @@ func TestSchedulerWaitsForRunningJobOnCancellation(t *testing.T) {
 	}
 
 	close(release)
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerRetriesFailedJob(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	var attempts atomic.Int32
+	succeeded := make(chan struct{}, 1)
+
+	_, err := scheduler.Add(
+		ScheduleFunc(func(after time.Time) time.Time { return after.Add(time.Hour) }),
+		JobFunc(func(context.Context) error {
+			if attempts.Add(1) == 1 {
+				return errors.New("transient failure")
+			}
+			succeeded <- struct{}{}
+			return nil
+		}),
+		WithRetry(2, func() backoff.Backoff {
+			return backoff.NewBackoffInterval(time.Second)
+		}),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Hour)
+	<-clock.timerAdded
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case <-succeeded:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not retry the failed job")
+	}
+	assert.Equal(t, int32(2), attempts.Load())
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAppliesTimeoutPerAttempt(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	timedOut := make(chan error, 1)
+
+	_, err := scheduler.Add(
+		ScheduleFunc(func(after time.Time) time.Time { return after.Add(time.Hour) }),
+		JobFunc(func(ctx context.Context) error {
+			<-ctx.Done()
+			timedOut <- ctx.Err()
+			return ctx.Err()
+		}),
+		WithTimeout(10*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Hour)
+
+	select {
+	case err := <-timedOut:
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not apply the job timeout")
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerSkipsOverlappingJob(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var runs atomic.Int32
+
+	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		if runs.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return nil
+	}, WithOverlap(SkipOverlap))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-started
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-clock.timerAdded
+
+	assert.Equal(t, int32(1), runs.Load())
+	close(release)
+	cancel()
 	require.NoError(t, <-done)
 }
 
