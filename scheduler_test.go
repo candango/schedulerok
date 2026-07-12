@@ -201,6 +201,34 @@ func TestSchedulerAppliesTimeoutPerAttempt(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestSchedulerAllowsOverlappingJobsByDefault(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+
+	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-started
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-started
+
+	close(release)
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestSchedulerSkipsOverlappingJob(t *testing.T) {
 	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
 	scheduler := New(WithClock(clock))
@@ -254,6 +282,73 @@ func TestSchedulerRejectsScheduleThatDoesNotAdvance(t *testing.T) {
 
 func TestSchedulerRejectsNilContext(t *testing.T) {
 	assert.ErrorIs(t, New().Run(nil), ErrNilContext)
+}
+
+func TestSchedulerRemoveStopsFutureRuns(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	ran := make(chan struct{}, 1)
+
+	id, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		ran <- struct{}{}
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+
+	require.NoError(t, scheduler.Remove(id))
+	clock.Advance(time.Second)
+
+	select {
+	case <-ran:
+		t.Fatal("removed job ran")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+	assert.ErrorIs(t, scheduler.Remove(id), ErrUnknownJob)
+}
+
+func TestSchedulerRemoveAllowsRunningJobToFinish(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	succeeded := make(chan Event, 1)
+
+	id, err := scheduler.AddIntervalFunc(
+		time.Second,
+		func(context.Context) error {
+			close(started)
+			<-release
+			return nil
+		},
+		WithHooks(Hooks{OnSuccess: func(_ context.Context, event Event) {
+			succeeded <- event
+		}}),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-started
+
+	require.NoError(t, scheduler.Remove(id))
+	close(release)
+
+	event := <-succeeded
+	assert.Equal(t, id, event.JobID)
+
+	cancel()
+	require.NoError(t, <-done)
 }
 
 func TestSchedulerRejectsAddAfterStart(t *testing.T) {

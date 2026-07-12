@@ -22,6 +22,8 @@ var (
 	ErrInvalidSchedule = errors.New("scheduler schedule must return a future time")
 	// ErrNilContext indicates that Run received a nil context.
 	ErrNilContext = errors.New("scheduler context must not be nil")
+	// ErrUnknownJob indicates that Remove did not find the requested registration.
+	ErrUnknownJob = errors.New("scheduler job ID was not found")
 )
 
 // JobID identifies one job registration in a Scheduler.
@@ -35,6 +37,7 @@ type Scheduler struct {
 	registrations map[JobID]*registration
 	nextID        uint64
 	running       bool
+	wake          chan struct{}
 }
 
 type registration struct {
@@ -52,6 +55,7 @@ func New(options ...Option) *Scheduler {
 	scheduler := &Scheduler{
 		clock:         systemClock{},
 		registrations: make(map[JobID]*registration),
+		wake:          make(chan struct{}, 1),
 	}
 
 	for _, option := range options {
@@ -99,6 +103,24 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 		hooks:    config.hooks,
 	}
 	return id, nil
+}
+
+// Remove stops future runs for id. A job that is already running is not
+// interrupted and remains subject to normal shutdown handling.
+func (s *Scheduler) Remove(id JobID) error {
+	s.mu.Lock()
+	if _, exists := s.registrations[id]; !exists {
+		s.mu.Unlock()
+		return ErrUnknownJob
+	}
+	delete(s.registrations, id)
+	s.mu.Unlock()
+
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 // AddFunc adapts fn to Job and registers it according to schedule.
@@ -218,6 +240,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			timer.Stop()
 			jobs.Wait()
 			return nil
+		case <-s.wake:
+			timer.Stop()
+			continue
 		case now = <-timer.Chan():
 			timer.Stop()
 		}
@@ -230,6 +255,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) nextRun() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var next time.Time
 	for _, registration := range s.registrations {
 		if next.IsZero() || registration.next.Before(next) {
@@ -240,6 +268,9 @@ func (s *Scheduler) nextRun() (time.Time, bool) {
 }
 
 func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGroup) error {
+	s.mu.Lock()
+	var due []*registration
+	var skipped []*registration
 	for _, registration := range s.registrations {
 		if registration.next.After(now) {
 			continue
@@ -248,15 +279,23 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 		previous := registration.next
 		registration.next = registration.schedule.Next(previous)
 		if !registration.next.After(previous) {
+			s.mu.Unlock()
 			return ErrInvalidSchedule
 		}
 
 		if registration.policy.overlap == SkipOverlap &&
 			!registration.running.CompareAndSwap(false, true) {
-			registration.callHook(ctx, registration.hooks.OnSkip, Event{JobID: registration.id})
+			skipped = append(skipped, registration)
 			continue
 		}
+		due = append(due, registration)
+	}
+	s.mu.Unlock()
 
+	for _, registration := range skipped {
+		registration.callHook(ctx, registration.hooks.OnSkip, Event{JobID: registration.id})
+	}
+	for _, registration := range due {
 		jobs.Add(1)
 		go s.runJob(ctx, registration, jobs)
 	}

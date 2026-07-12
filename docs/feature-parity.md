@@ -27,7 +27,7 @@ any schedule implementation that satisfies `Schedule`.
 | Retry and backoff | Available | Available | Available | Per-registration retry with isolated backoff state. |
 | Overlap policy | Available | Available | Available through configuration | Per-job allow or skip semantics; queue remains future work. |
 | Global concurrency limit | Not planned yet | Available | Available | Add only when real workloads require it. |
-| Pause, resume, remove, and update jobs | Not planned yet | Available | Available | Add after the scheduler API is stable. |
+| Pause, resume, remove, and update jobs | Remove only | Available | Available | Pause, resume, and update remain future work. |
 | Lifecycle hooks | Available | Available | Listener-based extensions | Hooks for start, success, failure, skip, and retry. |
 | Logs and metrics integration | Available through hooks | Available | Available | Applications choose logging and metrics. |
 | Misfire handling | Backlog | Available | Available | Define explicit missed-schedule semantics before adding it. |

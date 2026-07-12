@@ -62,7 +62,8 @@ id, err := scheduler.Add(schedule, job, scheduler.WithID("heartbeat"))
 ```
 
 The ID belongs to the registration of a `Schedule` with a `Job`; a `Schedule`
-remains a reusable, identity-free rule.
+remains a reusable, identity-free rule. `Remove(id)` stops future runs for a
+registration; an execution already in progress is allowed to finish.
 
 `JobFunc` adapts `func(context.Context) error` to `Job`, following the same
 pattern as `http.HandlerFunc` and `cron.FuncJob`.
