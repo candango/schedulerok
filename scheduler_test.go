@@ -72,6 +72,51 @@ func TestSchedulerRunsIntervalFunctionWithConfiguredClock(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestSchedulerWaitsForRunningJobOnCancellation(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- scheduler.Run(ctx)
+	}()
+
+	select {
+	case <-clock.timerAdded:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not create a timer")
+	}
+
+	clock.Advance(time.Second)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled job did not start")
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+		t.Fatal("scheduler returned before the running job completed")
+	default:
+	}
+
+	close(release)
+	require.NoError(t, <-done)
+}
+
 func TestSchedulerRejectsScheduleThatDoesNotAdvance(t *testing.T) {
 	scheduler := New()
 	_, err := scheduler.Add(ScheduleFunc(func(after time.Time) time.Time {
