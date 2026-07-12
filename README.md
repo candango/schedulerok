@@ -51,6 +51,23 @@ metrics while exposing the hooks needed for those integrations.
 - context-based cancellation and graceful shutdown;
 - application-owned configuration translated into scheduler registrations.
 
+## Example
+
+Run the basic interval scheduler and stop it with `Ctrl+C`:
+
+```bash
+go run ./examples/basic
+```
+
+The example demonstrates interval registration, a stable job ID, lifecycle
+hooks, and graceful shutdown. Output identifies its source:
+
+```text
+[hook.OnStart] heartbeat started (attempt 1)
+[job.Run] heartbeat
+[hook.OnSuccess] heartbeat completed
+```
+
 ## Requirements
 
 - Go 1.24.6 or later
