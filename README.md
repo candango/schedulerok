@@ -101,19 +101,6 @@ the scheduler down with it. It freezes in place, fires `OnFailure`, and
 stays out of consideration until `Remove` is called explicitly;
 `FrozenIDs()` reports which registrations are stuck.
 
-## Compared to other Go schedulers
-
-`schedulerok` follows the same minimal `Schedule.Next(time.Time) time.Time`
-contract as [robfig/cron](https://github.com/robfig/cron), separates jobs
-from schedules the way [go-quartz](https://github.com/reugn/go-quartz)
-separates jobs from triggers, and covers the same ground as
-[gocron](https://github.com/go-co-op/gocron) for timeouts, retries, and
-overlap policy. Cron expression parsing is not implemented here — it is
-consumed from [candango/intervalok](https://github.com/candango/intervalok)
-through the same `Schedule` interface used everywhere else. See
-[docs/feature-parity.md](./docs/feature-parity.md) for the full capability
-matrix and what remains backlog.
-
 ## Example
 
 Run the basic interval scheduler and stop it with `Ctrl+C`:
