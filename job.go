@@ -9,3 +9,11 @@ import "context"
 type Job interface {
 	Run(context.Context) error
 }
+
+// JobFunc adapts a function to Job.
+type JobFunc func(context.Context) error
+
+// Run executes fn.
+func (fn JobFunc) Run(ctx context.Context) error {
+	return fn(ctx)
+}

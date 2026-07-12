@@ -9,14 +9,16 @@ import (
 )
 
 type fakeClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*fakeTimer
+	mu         sync.Mutex
+	now        time.Time
+	timers     []*fakeTimer
+	timerAdded chan struct{}
 }
 
 func newFakeClock(now time.Time) *fakeClock {
 	return &fakeClock{
-		now: now,
+		now:        now,
+		timerAdded: make(chan struct{}, 16),
 	}
 }
 
@@ -33,8 +35,12 @@ func (c *fakeClock) NewTimer(delay time.Duration) Timer {
 	if delay > 0 {
 		c.timers = append(c.timers, timer)
 	}
+	c.mu.Unlock()
 
-	defer c.mu.Unlock()
+	select {
+	case c.timerAdded <- struct{}{}:
+	default:
+	}
 
 	if delay <= 0 {
 		timer.fire(timer.due)

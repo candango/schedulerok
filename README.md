@@ -9,9 +9,8 @@
 The goal is to provide a quick, configuration-oriented scheduler experience
 with a Go-native runtime.
 
-Each job will own its scheduling timer. The scheduler will own the lifecycle:
-registration, startup, cancellation, graceful shutdown, and waiting for running
-jobs.
+The scheduler owns the scheduling timer and lifecycle: registration, startup,
+cancellation, graceful shutdown, and waiting for running jobs.
 
 ## Building blocks
 
@@ -23,20 +22,22 @@ jobs.
 
 ## Intended developer experience
 
-Applications should be able to register job factories, load their own
-configuration, and start a runner with a small amount of code:
+Applications register work directly and start a scheduler with a small amount
+of code:
 
 ```go
-registry := scheduler.NewRegistry()
-registry.Register("heartbeat", jobs.NewHeartbeat)
+s := scheduler.New()
 
-runner, err := scheduler.NewFromConfig(cfg, registry)
+_, err := s.AddIntervalFunc(5*time.Minute, heartbeat)
 if err != nil {
 	return err
 }
 
-return runner.Run(ctx)
+return s.Run(ctx)
 ```
+
+Configuration loading and job factories belong to consuming applications. They
+can translate their configuration into `Add` calls with stable IDs.
 
 Configuration loading belongs to the consuming application. The library should
 remain agnostic about YAML, environment variables, databases, logging, and
@@ -48,7 +49,7 @@ metrics while exposing the hooks needed for those integrations.
 - job timeouts and retry policies;
 - explicit overlap behavior per job;
 - context-based cancellation and graceful shutdown;
-- a registry-based path for configuration-driven job creation.
+- application-owned configuration translated into scheduler registrations.
 
 ## Requirements
 
