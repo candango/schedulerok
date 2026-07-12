@@ -519,6 +519,270 @@ func TestSchedulerAddConcurrentDuringRun(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestSchedulerAdaptiveJobAdoptsReturnedSchedule(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	ran := make(chan struct{}, 1)
+
+	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+		ran <- struct{}{}
+		return NewIntervalSchedule(5 * time.Second)
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("adaptive job did not run")
+	}
+
+	want := clock.Now().Add(5 * time.Second)
+	deadline := time.After(time.Second)
+	for {
+		scheduler.mu.Lock()
+		next := scheduler.registrations[id].next
+		scheduler.mu.Unlock()
+		if next.Equal(want) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("registration did not adopt the returned schedule; next=%v want=%v", next, want)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAdaptiveJobNilScheduleKeepsCurrent(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	ran := make(chan struct{}, 2)
+
+	_, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+		ran <- struct{}{}
+		return nil, nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-ran
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-ran
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAdaptiveJobInvalidScheduleFreezes(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	failed := make(chan Event, 1)
+
+	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+		return ScheduleFunc(func(after time.Time) time.Time { return after }), nil
+	}, WithHooks(Hooks{OnFailure: func(_ context.Context, event Event) {
+		failed <- event
+	}}))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case event := <-failed:
+		assert.Equal(t, id, event.JobID)
+		assert.ErrorIs(t, event.Error, ErrInvalidSchedule)
+	case <-time.After(time.Second):
+		t.Fatal("invalid adaptive schedule did not fire OnFailure")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		frozen := scheduler.FrozenIDs()
+		if len(frozen) == 1 && frozen[0] == id {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("registration did not freeze after an invalid adaptive schedule; frozen=%v", frozen)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAdaptiveJobHonorsScheduleDespiteError(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	failed := make(chan Event, 1)
+	jobErr := errors.New("transient")
+
+	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+		sched, _ := NewIntervalSchedule(5 * time.Second)
+		return sched, jobErr
+	}, WithHooks(Hooks{OnFailure: func(_ context.Context, event Event) {
+		failed <- event
+	}}))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case event := <-failed:
+		assert.ErrorIs(t, event.Error, jobErr)
+	case <-time.After(time.Second):
+		t.Fatal("job failure did not fire OnFailure")
+	}
+
+	want := clock.Now().Add(5 * time.Second)
+	deadline := time.After(time.Second)
+	for {
+		scheduler.mu.Lock()
+		next := scheduler.registrations[id].next
+		scheduler.mu.Unlock()
+		if next.Equal(want) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("schedule was not adopted despite job error; next=%v want=%v", next, want)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAdaptiveJobRetryUsesOnlyFinalAttemptSchedule(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	var attempts atomic.Int32
+	succeeded := make(chan Event, 1)
+
+	first, err := NewIntervalSchedule(2 * time.Second)
+	require.NoError(t, err)
+	final, err := NewIntervalSchedule(9 * time.Second)
+	require.NoError(t, err)
+
+	id, err := scheduler.Add(
+		ScheduleFunc(func(after time.Time) time.Time { return after.Add(time.Hour) }),
+		AdaptiveJobFunc(func(context.Context) (Schedule, error) {
+			if attempts.Add(1) == 1 {
+				return first, errors.New("transient failure")
+			}
+			return final, nil
+		}),
+		WithRetry(2, func() backoff.Backoff {
+			return backoff.NewBackoffInterval(time.Second)
+		}),
+		WithHooks(Hooks{OnSuccess: func(_ context.Context, event Event) {
+			succeeded <- event
+		}}),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Hour)
+	<-clock.timerAdded
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	select {
+	case <-succeeded:
+	case <-time.After(time.Second):
+		t.Fatal("adaptive job did not succeed on retry")
+	}
+	assert.Equal(t, int32(2), attempts.Load())
+
+	want := clock.Now().Add(9 * time.Second)
+	deadline := time.After(time.Second)
+	for {
+		scheduler.mu.Lock()
+		next := scheduler.registrations[id].next
+		scheduler.mu.Unlock()
+		if next.Equal(want) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("final attempt schedule not adopted; next=%v want=%v", next, want)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAdaptiveJobSkipsRescheduleAfterRemove(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+		close(started)
+		<-release
+		return NewIntervalSchedule(5 * time.Second)
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-started
+
+	require.NoError(t, scheduler.Remove(id))
+	close(release)
+
+	cancel()
+	require.NoError(t, <-done)
+
+	scheduler.mu.Lock()
+	_, exists := scheduler.registrations[id]
+	scheduler.mu.Unlock()
+	assert.False(t, exists, "removed registration must not be reinserted by a late reschedule")
+}
+
 func TestCronSeriesSatisfiesSchedule(t *testing.T) {
 	series, err := intervalcron.NewCronSeries("*/5 * * * *")
 	require.NoError(t, err)

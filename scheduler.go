@@ -42,7 +42,7 @@ type Scheduler struct {
 type registration struct {
 	id       JobID
 	schedule Schedule
-	job      Job
+	job      AdaptiveJob
 	policy   executionPolicy
 	hooks    Hooks
 	next     time.Time
@@ -87,6 +87,11 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 		return "", err
 	}
 
+	adaptive, ok := job.(AdaptiveJob)
+	if !ok {
+		adaptive = fixedScheduleJob{job: job}
+	}
+
 	s.mu.Lock()
 
 	s.nextID++
@@ -99,7 +104,7 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 	reg := &registration{
 		id:       id,
 		schedule: schedule,
-		job:      job,
+		job:      adaptive,
 		policy:   config.policy,
 		hooks:    config.hooks,
 	}
@@ -227,6 +232,77 @@ func (s *Scheduler) AddCronFunc(
 	}
 
 	return s.AddCronJob(spec, fn, options...)
+}
+
+// AddAdaptiveFunc adapts fn to AdaptiveJob and registers it according to schedule.
+func (s *Scheduler) AddAdaptiveFunc(
+	schedule Schedule,
+	fn AdaptiveJobFunc,
+	options ...RegistrationOption,
+) (JobID, error) {
+	if fn == nil {
+		return "", ErrNilJob
+	}
+
+	return s.Add(schedule, fn, options...)
+}
+
+// AddAdaptiveIntervalJob creates a fixed interval schedule and registers an
+// AdaptiveJob that may redefine it after each run.
+func (s *Scheduler) AddAdaptiveIntervalJob(
+	interval time.Duration,
+	job AdaptiveJob,
+	options ...RegistrationOption,
+) (JobID, error) {
+	schedule, err := NewIntervalSchedule(interval)
+	if err != nil {
+		return "", err
+	}
+
+	return s.Add(schedule, job, options...)
+}
+
+// AddAdaptiveIntervalFunc creates a fixed interval schedule and registers fn
+// as an AdaptiveJob that may redefine it after each run.
+func (s *Scheduler) AddAdaptiveIntervalFunc(
+	interval time.Duration,
+	fn AdaptiveJobFunc,
+	options ...RegistrationOption,
+) (JobID, error) {
+	if fn == nil {
+		return "", ErrNilJob
+	}
+
+	return s.AddAdaptiveIntervalJob(interval, fn, options...)
+}
+
+// AddAdaptiveCronJob parses spec as an intervalok cron schedule and registers
+// an AdaptiveJob that may redefine it after each run.
+func (s *Scheduler) AddAdaptiveCronJob(
+	spec string,
+	job AdaptiveJob,
+	options ...RegistrationOption,
+) (JobID, error) {
+	schedule, err := NewCronSchedule(spec)
+	if err != nil {
+		return "", err
+	}
+
+	return s.Add(schedule, job, options...)
+}
+
+// AddAdaptiveCronFunc parses spec as an intervalok cron schedule and
+// registers fn as an AdaptiveJob that may redefine it after each run.
+func (s *Scheduler) AddAdaptiveCronFunc(
+	spec string,
+	fn AdaptiveJobFunc,
+	options ...RegistrationOption,
+) (JobID, error) {
+	if fn == nil {
+		return "", ErrNilJob
+	}
+
+	return s.AddAdaptiveCronJob(spec, fn, options...)
 }
 
 // Run starts the scheduler and blocks until ctx is cancelled. New job runs stop
@@ -375,6 +451,13 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 		retryBackoff = backoffStrategy()
 	}
 
+	// Only the attempt that exits the retry loop owns the returned Schedule;
+	// intermediate attempts are overwritten and never applied.
+	var lastSchedule Schedule
+	defer func() {
+		s.applyReschedule(ctx, registration, lastSchedule)
+	}()
+
 	for attempt := 0; attempt < attempts; attempt++ {
 		event := Event{JobID: registration.id, Attempt: attempt + 1}
 		registration.callHook(ctx, registration.hooks.OnStart, event)
@@ -385,8 +468,9 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 			attemptCtx, cancel = context.WithTimeout(ctx, registration.policy.timeout)
 		}
 
-		err := registration.job.Run(attemptCtx)
+		newSchedule, err := registration.job.RunAdaptive(attemptCtx)
 		cancel()
+		lastSchedule = newSchedule
 		if err == nil {
 			registration.callHook(ctx, registration.hooks.OnSuccess, event)
 			return
@@ -403,6 +487,42 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 		if !s.wait(ctx, event.RetryDelay) {
 			return
 		}
+	}
+}
+
+// applyReschedule adopts newSchedule for registration's future runs. A nil
+// newSchedule means the job did not ask to change its Schedule. If the
+// registration was removed while the job ran, the update is skipped. A
+// Schedule that does not advance freezes the registration the same way
+// runDue does for interval and cron schedules.
+func (s *Scheduler) applyReschedule(ctx context.Context, registration *registration, newSchedule Schedule) {
+	if newSchedule == nil {
+		return
+	}
+
+	s.mu.Lock()
+	if _, exists := s.registrations[registration.id]; !exists {
+		s.mu.Unlock()
+		return
+	}
+
+	now := s.clock.Now()
+	next := newSchedule.Next(now)
+	if !next.After(now) {
+		registration.frozen = true
+		s.mu.Unlock()
+		registration.callHook(ctx, registration.hooks.OnFailure,
+			Event{JobID: registration.id, Error: ErrInvalidSchedule})
+		return
+	}
+
+	registration.schedule = newSchedule
+	registration.next = next
+	s.mu.Unlock()
+
+	select {
+	case s.wake <- struct{}{}:
+	default:
 	}
 }
 
