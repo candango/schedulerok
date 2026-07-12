@@ -12,8 +12,6 @@ import (
 var (
 	// ErrSchedulerRunning indicates that Run was called while the scheduler is active.
 	ErrSchedulerRunning = errors.New("scheduler is already running")
-	// ErrSchedulerStarted indicates that a registration was attempted after Run started.
-	ErrSchedulerStarted = errors.New("scheduler has already started")
 	// ErrNilSchedule indicates that a registration has no schedule.
 	ErrNilSchedule = errors.New("scheduler schedule must not be nil")
 	// ErrNilJob indicates that a registration has no job.
@@ -68,7 +66,9 @@ func New(options ...Option) *Scheduler {
 	return scheduler
 }
 
-// Add registers a Job to run according to a Schedule.
+// Add registers a Job to run according to a Schedule. It may be called before
+// or after Run starts; a registration added while running is scheduled from
+// the current time and wakes the scheduler's timer loop.
 func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOption) (JobID, error) {
 	if schedule == nil {
 		return "", ErrNilSchedule
@@ -77,31 +77,48 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 		return "", ErrNilJob
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.running {
-		return "", ErrSchedulerStarted
-	}
-
 	config, err := registrationConfig(options)
 	if err != nil {
 		return "", err
 	}
 
+	s.mu.Lock()
+
 	s.nextID++
 	id := registrationID(s.nextID, config)
 	if _, exists := s.registrations[id]; exists {
+		s.mu.Unlock()
 		return "", fmt.Errorf("scheduler: job ID %q already exists", id)
 	}
 
-	s.registrations[id] = &registration{
+	reg := &registration{
 		id:       id,
 		schedule: schedule,
 		job:      job,
 		policy:   config.policy,
 		hooks:    config.hooks,
 	}
+
+	running := s.running
+	if running {
+		now := s.clock.Now()
+		reg.next = schedule.Next(now)
+		if !reg.next.After(now) {
+			s.mu.Unlock()
+			return "", ErrInvalidSchedule
+		}
+	}
+
+	s.registrations[id] = reg
+	s.mu.Unlock()
+
+	if running {
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
+
 	return id, nil
 }
 
@@ -224,9 +241,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	for {
 		next, ok := s.nextRun()
 		if !ok {
-			<-ctx.Done()
-			jobs.Wait()
-			return nil
+			select {
+			case <-ctx.Done():
+				jobs.Wait()
+				return nil
+			case <-s.wake:
+				continue
+			}
 		}
 
 		delay := next.Sub(s.clock.Now())

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -351,13 +352,8 @@ func TestSchedulerRemoveAllowsRunningJobToFinish(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-func TestSchedulerRejectsAddAfterStart(t *testing.T) {
-	scheduler := New()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- scheduler.Run(ctx)
-	}()
+func waitForRunning(t *testing.T, scheduler *Scheduler) {
+	t.Helper()
 
 	deadline := time.After(time.Second)
 	for {
@@ -365,7 +361,7 @@ func TestSchedulerRejectsAddAfterStart(t *testing.T) {
 		running := scheduler.running
 		scheduler.mu.Unlock()
 		if running {
-			break
+			return
 		}
 
 		select {
@@ -375,13 +371,80 @@ func TestSchedulerRejectsAddAfterStart(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
+}
 
-	schedule, err := NewIntervalSchedule(time.Minute)
-	require.NoError(t, err)
-	_, err = scheduler.Add(schedule, JobFunc(func(context.Context) error {
+func TestSchedulerAddRegistersJobAfterStart(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	ran := make(chan struct{}, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	waitForRunning(t, scheduler)
+
+	id, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		ran <- struct{}{}
 		return nil
-	}))
-	assert.ErrorIs(t, err, ErrSchedulerStarted)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, JobID("job-1"), id)
+
+	select {
+	case <-clock.timerAdded:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not re-arm its timer for the new registration")
+	}
+
+	clock.Advance(time.Second)
+
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("job registered after start did not run")
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerAddConcurrentDuringRun(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+
+	waitForRunning(t, scheduler)
+
+	const registrants = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, registrants)
+	wg.Add(registrants)
+	for i := 0; i < registrants; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := scheduler.AddIntervalFunc(time.Minute, func(context.Context) error {
+				return nil
+			})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		assert.NoError(t, err)
+	}
+
+	scheduler.mu.Lock()
+	assert.Len(t, scheduler.registrations, registrants)
+	for _, registration := range scheduler.registrations {
+		assert.False(t, registration.next.IsZero())
+	}
+	scheduler.mu.Unlock()
 
 	cancel()
 	require.NoError(t, <-done)
