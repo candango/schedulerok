@@ -111,6 +111,13 @@ factory so concurrent scheduled runs never share mutable backoff state. The
 default overlap policy is `AllowOverlap`; `SkipOverlap` discards a due run when
 the previous run is still active.
 
+## Lifecycle hooks
+
+`WithHooks` provides synchronous per-registration callbacks for `OnStart`,
+`OnSuccess`, `OnFailure`, `OnRetry`, and `OnSkip`. Each callback receives an
+`Event` with the job ID, attempt, failure error, and retry delay when relevant.
+Hooks must return promptly and do not choose a logging or metrics dependency.
+
 ## Lifecycle
 
 `Scheduler` is the public coordinator. It owns multiple registered jobs,

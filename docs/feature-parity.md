@@ -28,8 +28,8 @@ any schedule implementation that satisfies `Schedule`.
 | Overlap policy | Available | Available | Available through configuration | Per-job allow or skip semantics; queue remains future work. |
 | Global concurrency limit | Not planned yet | Available | Available | Add only when real workloads require it. |
 | Pause, resume, remove, and update jobs | Not planned yet | Available | Available | Add after the scheduler API is stable. |
-| Lifecycle hooks | Backlog | Available | Listener-based extensions | Hooks for start, success, failure, skip, and retry. |
-| Logs and metrics integration | Backlog | Available | Available | Expose hooks; applications choose logging and metrics. |
+| Lifecycle hooks | Available | Available | Listener-based extensions | Hooks for start, success, failure, skip, and retry. |
+| Logs and metrics integration | Available through hooks | Available | Available | Applications choose logging and metrics. |
 | Misfire handling | Backlog | Available | Available | Define explicit missed-schedule semantics before adding it. |
 | Distributed coordination | Long-term backlog | Available | Available | Add only for multi-replica ownership requirements. |
 | Durable jobs and schedule state | Long-term backlog | Limited | Queue-backed options | Add only when restart recovery is required. |

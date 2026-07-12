@@ -25,6 +25,7 @@ type RegistrationOption func(*registrationOptions)
 type registrationOptions struct {
 	id     JobID
 	policy executionPolicy
+	hooks  Hooks
 }
 
 // WithID assigns a stable ID to one registered job.

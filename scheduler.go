@@ -38,9 +38,11 @@ type Scheduler struct {
 }
 
 type registration struct {
+	id       JobID
 	schedule Schedule
 	job      Job
 	policy   executionPolicy
+	hooks    Hooks
 	next     time.Time
 	running  atomic.Bool
 }
@@ -90,9 +92,11 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 	}
 
 	s.registrations[id] = &registration{
+		id:       id,
 		schedule: schedule,
 		job:      job,
 		policy:   config.policy,
+		hooks:    config.hooks,
 	}
 	return id, nil
 }
@@ -249,6 +253,7 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 
 		if registration.policy.overlap == SkipOverlap &&
 			!registration.running.CompareAndSwap(false, true) {
+			registration.callHook(ctx, registration.hooks.OnSkip, Event{JobID: registration.id})
 			continue
 		}
 
@@ -281,6 +286,9 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 	}
 
 	for attempt := 0; attempt < attempts; attempt++ {
+		event := Event{JobID: registration.id, Attempt: attempt + 1}
+		registration.callHook(ctx, registration.hooks.OnStart, event)
+
 		attemptCtx := ctx
 		cancel := func() {}
 		if registration.policy.timeout > 0 {
@@ -289,13 +297,28 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 
 		err := registration.job.Run(attemptCtx)
 		cancel()
-		if err == nil || ctx.Err() != nil || attempt == attempts-1 {
+		if err == nil {
+			registration.callHook(ctx, registration.hooks.OnSuccess, event)
 			return
 		}
 
-		if retryBackoff == nil || !s.wait(ctx, retryBackoff.Next()) {
+		event.Error = err
+		registration.callHook(ctx, registration.hooks.OnFailure, event)
+		if ctx.Err() != nil || attempt == attempts-1 || retryBackoff == nil {
 			return
 		}
+
+		event.RetryDelay = retryBackoff.Next()
+		registration.callHook(ctx, registration.hooks.OnRetry, event)
+		if !s.wait(ctx, event.RetryDelay) {
+			return
+		}
+	}
+}
+
+func (registration *registration) callHook(ctx context.Context, hook func(context.Context, Event), event Event) {
+	if hook != nil {
+		hook(ctx, event)
 	}
 }
 

@@ -125,6 +125,7 @@ func TestSchedulerRetriesFailedJob(t *testing.T) {
 	scheduler := New(WithClock(clock))
 	var attempts atomic.Int32
 	succeeded := make(chan struct{}, 1)
+	success := make(chan Event, 1)
 
 	_, err := scheduler.Add(
 		ScheduleFunc(func(after time.Time) time.Time { return after.Add(time.Hour) }),
@@ -138,6 +139,9 @@ func TestSchedulerRetriesFailedJob(t *testing.T) {
 		WithRetry(2, func() backoff.Backoff {
 			return backoff.NewBackoffInterval(time.Second)
 		}),
+		WithHooks(Hooks{OnSuccess: func(_ context.Context, event Event) {
+			success <- event
+		}}),
 	)
 	require.NoError(t, err)
 
@@ -156,6 +160,9 @@ func TestSchedulerRetriesFailedJob(t *testing.T) {
 		t.Fatal("scheduler did not retry the failed job")
 	}
 	assert.Equal(t, int32(2), attempts.Load())
+	event := <-success
+	assert.Equal(t, JobID("job-1"), event.JobID)
+	assert.Equal(t, 2, event.Attempt)
 
 	cancel()
 	require.NoError(t, <-done)
@@ -200,6 +207,7 @@ func TestSchedulerSkipsOverlappingJob(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var runs atomic.Int32
+	skipped := make(chan Event, 1)
 
 	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
 		if runs.Add(1) == 1 {
@@ -207,7 +215,9 @@ func TestSchedulerSkipsOverlappingJob(t *testing.T) {
 		}
 		<-release
 		return nil
-	}, WithOverlap(SkipOverlap))
+	}, WithOverlap(SkipOverlap), WithHooks(Hooks{OnSkip: func(_ context.Context, event Event) {
+		skipped <- event
+	}}))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,6 +231,7 @@ func TestSchedulerSkipsOverlappingJob(t *testing.T) {
 	<-clock.timerAdded
 
 	assert.Equal(t, int32(1), runs.Load())
+	assert.Equal(t, JobID("job-1"), (<-skipped).JobID)
 	close(release)
 	cancel()
 	require.NoError(t, <-done)
