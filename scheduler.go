@@ -183,6 +183,25 @@ func (s *Scheduler) AddFunc(
 	return s.Add(schedule, fn, options...)
 }
 
+// AddAdaptiveFunc adapts separate execution and schedule-selection functions
+// to AdaptiveJob and registers them according to schedule. A nil next function
+// registers run as a regular Job and preserves the current schedule.
+func (s *Scheduler) AddAdaptiveFunc(
+	schedule Schedule,
+	run JobFunc,
+	next NextScheduleFunc,
+	options ...RegistrationOption,
+) (JobID, error) {
+	if run == nil {
+		return "", ErrNilJob
+	}
+	if next == nil {
+		return s.AddFunc(schedule, run, options...)
+	}
+
+	return s.Add(schedule, adaptiveJobFunc{run: run, next: next}, options...)
+}
+
 // AddIntervalJob creates a fixed interval schedule and registers job.
 func (s *Scheduler) AddIntervalJob(
 	interval time.Duration,

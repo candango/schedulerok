@@ -3,7 +3,7 @@
 A minimal, Go-native scheduler that owns its timer loop end to end and lets
 schedules change their own mind.
 
-> **Release:** `0.2.0` — adaptive scheduling API corrected; breaking changes from `0.1.0` are documented below.
+> **Status:** early development. The API is not stable yet.
 
 ## About
 
@@ -99,7 +99,23 @@ calculated. The `current` argument is available to stateful schedules that
 need to inspect the existing schedule before producing a replacement.
 
 A plain `Job` passed to `Add` is wrapped internally, so both job kinds use the
-same registration API.
+same registration API. For function-based jobs, `AddAdaptiveFunc` accepts the
+execution and schedule-selection functions separately:
+
+```go
+_, err := s.AddAdaptiveFunc(
+	schedule,
+	func(ctx context.Context) error {
+		return poll(ctx)
+	},
+	func(current scheduler.Schedule) (scheduler.Schedule, error) {
+		return scheduler.NewIntervalSchedule(5 * time.Minute)
+	},
+)
+```
+
+If the schedule-selection function is `nil`, `AddAdaptiveFunc` delegates to
+`AddFunc` and keeps the schedule fixed.
 
 ## Lifecycle, policies, and runtime control
 
@@ -128,19 +144,6 @@ A registration whose `Schedule` stops advancing does not take the rest of
 the scheduler down with it. It freezes in place, fires `OnFailure`, and
 stays out of consideration until `Remove` is called explicitly;
 `FrozenIDs()` reports which registrations are stuck.
-
-## Version 0.2.0
-
-Version `0.2.0` replaces the invalid `0.1.0` adaptive contract. Adaptive jobs
-must implement both `Job.Run` and:
-
-```go
-NextSchedule(current Schedule) (Schedule, error)
-```
-
-The old `RunAdaptive(context.Context)` contract and `AdaptiveJobFunc` adapter
-are removed. Adaptive jobs must be implemented as stateful types that satisfy
-both methods above; registration uses the regular `AddXxx` methods.
 
 ## Example
 

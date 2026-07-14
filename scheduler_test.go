@@ -587,6 +587,64 @@ func TestAdaptiveJobReceivesCurrentSchedule(t *testing.T) {
 	assert.Equal(t, current, job.current)
 }
 
+func TestAddAdaptiveFuncRejectsNilRun(t *testing.T) {
+	scheduler := New()
+	schedule := IntervalSchedule{interval: time.Minute}
+
+	_, err := scheduler.AddAdaptiveFunc(schedule, nil, nil)
+	assert.ErrorIs(t, err, ErrNilJob)
+}
+
+func TestAddAdaptiveFuncNilNextUsesRegularJob(t *testing.T) {
+	scheduler := New()
+	schedule := IntervalSchedule{interval: time.Minute}
+	ran := false
+
+	id, err := scheduler.AddAdaptiveFunc(schedule, func(context.Context) error {
+		ran = true
+		return nil
+	}, nil)
+	require.NoError(t, err)
+
+	scheduler.mu.Lock()
+	job := scheduler.registrations[id].job
+	scheduler.mu.Unlock()
+
+	_, fixed := job.(fixedScheduleJob)
+	assert.True(t, fixed)
+	require.NoError(t, job.Run(context.Background()))
+	assert.True(t, ran)
+}
+
+func TestAddAdaptiveFuncBuildsTwoFunctionAdaptiveJob(t *testing.T) {
+	scheduler := New()
+	current := IntervalSchedule{interval: time.Minute}
+	replacement := IntervalSchedule{interval: 5 * time.Minute}
+	var received Schedule
+
+	id, err := scheduler.AddAdaptiveFunc(
+		current,
+		func(context.Context) error { return nil },
+		func(schedule Schedule) (Schedule, error) {
+			received = schedule
+			return replacement, nil
+		},
+	)
+	require.NoError(t, err)
+
+	scheduler.mu.Lock()
+	job := scheduler.registrations[id].job
+	scheduler.mu.Unlock()
+
+	adaptive, ok := job.(AdaptiveJob)
+	require.True(t, ok)
+	require.NoError(t, adaptive.Run(context.Background()))
+	got, err := adaptive.NextSchedule(current)
+	require.NoError(t, err)
+	assert.Equal(t, current, received)
+	assert.Equal(t, replacement, got)
+}
+
 func TestSchedulerAdaptiveJobAdoptsReturnedSchedule(t *testing.T) {
 	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
 	scheduler := New(WithClock(clock))

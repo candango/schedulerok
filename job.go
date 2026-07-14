@@ -18,6 +18,10 @@ func (fn JobFunc) Run(ctx context.Context) error {
 	return fn(ctx)
 }
 
+// NextScheduleFunc adapts a function to the schedule-selection part of an
+// AdaptiveJob.
+type NextScheduleFunc func(Schedule) (Schedule, error)
+
 // AdaptiveJob is a Job that may provide a replacement Schedule after each
 // execution.
 //
@@ -28,6 +32,19 @@ func (fn JobFunc) Run(ctx context.Context) error {
 type AdaptiveJob interface {
 	Job
 	NextSchedule(current Schedule) (Schedule, error)
+}
+
+type adaptiveJobFunc struct {
+	run  JobFunc
+	next NextScheduleFunc
+}
+
+func (j adaptiveJobFunc) Run(ctx context.Context) error {
+	return j.run(ctx)
+}
+
+func (j adaptiveJobFunc) NextSchedule(current Schedule) (Schedule, error) {
+	return j.next(current)
 }
 
 // fixedScheduleJob adapts a Job to AdaptiveJob. NextSchedule always returns a

@@ -102,6 +102,8 @@ support stateful schedule implementations.
 
 The former `RunAdaptive` and `AdaptiveJobFunc` contracts are removed in
 `0.2.0`; adaptive jobs must implement `Run` and `NextSchedule` separately.
+Function-based jobs can use `AddAdaptiveFunc(schedule, run, next, options...)`.
+It delegates to `AddFunc` when `next` is nil, preserving a fixed schedule.
 
 Cron parsing remains owned by `intervalok`; a cron convenience method delegates
 to that parser and then calls `Add`. The generic `Add` API remains independent
