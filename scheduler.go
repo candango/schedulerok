@@ -87,8 +87,11 @@ func (s *Scheduler) Add(schedule Schedule, job Job, options ...RegistrationOptio
 		return "", err
 	}
 
-	adaptive, ok := job.(AdaptiveJob)
-	if !ok {
+	var adaptive AdaptiveJob
+	adaptiveJob, ok := job.(AdaptiveJob)
+	if ok {
+		adaptive = adaptiveJob
+	} else {
 		adaptive = fixedScheduleJob{job: job}
 	}
 
@@ -232,77 +235,6 @@ func (s *Scheduler) AddCronFunc(
 	}
 
 	return s.AddCronJob(spec, fn, options...)
-}
-
-// AddAdaptiveFunc adapts fn to AdaptiveJob and registers it according to schedule.
-func (s *Scheduler) AddAdaptiveFunc(
-	schedule Schedule,
-	fn AdaptiveJobFunc,
-	options ...RegistrationOption,
-) (JobID, error) {
-	if fn == nil {
-		return "", ErrNilJob
-	}
-
-	return s.Add(schedule, fn, options...)
-}
-
-// AddAdaptiveIntervalJob creates a fixed interval schedule and registers an
-// AdaptiveJob that may redefine it after each run.
-func (s *Scheduler) AddAdaptiveIntervalJob(
-	interval time.Duration,
-	job AdaptiveJob,
-	options ...RegistrationOption,
-) (JobID, error) {
-	schedule, err := NewIntervalSchedule(interval)
-	if err != nil {
-		return "", err
-	}
-
-	return s.Add(schedule, job, options...)
-}
-
-// AddAdaptiveIntervalFunc creates a fixed interval schedule and registers fn
-// as an AdaptiveJob that may redefine it after each run.
-func (s *Scheduler) AddAdaptiveIntervalFunc(
-	interval time.Duration,
-	fn AdaptiveJobFunc,
-	options ...RegistrationOption,
-) (JobID, error) {
-	if fn == nil {
-		return "", ErrNilJob
-	}
-
-	return s.AddAdaptiveIntervalJob(interval, fn, options...)
-}
-
-// AddAdaptiveCronJob parses spec as an intervalok cron schedule and registers
-// an AdaptiveJob that may redefine it after each run.
-func (s *Scheduler) AddAdaptiveCronJob(
-	spec string,
-	job AdaptiveJob,
-	options ...RegistrationOption,
-) (JobID, error) {
-	schedule, err := NewCronSchedule(spec)
-	if err != nil {
-		return "", err
-	}
-
-	return s.Add(schedule, job, options...)
-}
-
-// AddAdaptiveCronFunc parses spec as an intervalok cron schedule and
-// registers fn as an AdaptiveJob that may redefine it after each run.
-func (s *Scheduler) AddAdaptiveCronFunc(
-	spec string,
-	fn AdaptiveJobFunc,
-	options ...RegistrationOption,
-) (JobID, error) {
-	if fn == nil {
-		return "", ErrNilJob
-	}
-
-	return s.AddAdaptiveCronJob(spec, fn, options...)
 }
 
 // Run starts the scheduler and blocks until ctx is cancelled. New job runs stop
@@ -468,9 +400,20 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 			attemptCtx, cancel = context.WithTimeout(ctx, registration.policy.timeout)
 		}
 
-		newSchedule, err := registration.job.RunAdaptive(attemptCtx)
+		err := registration.job.Run(attemptCtx)
 		cancel()
-		lastSchedule = newSchedule
+		if adaptive, ok := registration.job.(AdaptiveJob); ok {
+			// The current schedule is read when the final attempt completes so
+			// stateful schedules can inform the replacement decision.
+			current := s.currentSchedule(registration)
+			if current != nil {
+				newSchedule, scheduleErr := adaptive.NextSchedule(current)
+				lastSchedule = newSchedule
+				if err == nil {
+					err = scheduleErr
+				}
+			}
+		}
 		if err == nil {
 			registration.callHook(ctx, registration.hooks.OnSuccess, event)
 			return
@@ -495,6 +438,17 @@ func (s *Scheduler) runJob(ctx context.Context, registration *registration, jobs
 // registration was removed while the job ran, the update is skipped. A
 // Schedule that does not advance freezes the registration the same way
 // runDue does for interval and cron schedules.
+func (s *Scheduler) currentSchedule(registration *registration) Schedule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.registrations[registration.id]; !exists {
+		return nil
+	}
+
+	return registration.schedule
+}
+
 func (s *Scheduler) applyReschedule(ctx context.Context, registration *registration, newSchedule Schedule) {
 	if newSchedule == nil {
 		return

@@ -3,7 +3,7 @@
 A minimal, Go-native scheduler that owns its timer loop end to end and lets
 schedules change their own mind.
 
-> **Status:** early development. The API is not stable yet.
+> **Release:** `0.2.0` — adaptive scheduling API corrected; breaking changes from `0.1.0` are documented below.
 
 ## About
 
@@ -31,8 +31,9 @@ stable IDs; `schedulerok` never parses configuration itself.
 ## Registering jobs
 
 `Add` and `AddFunc` take any `Schedule`. `AddIntervalJob`/`AddIntervalFunc`
-and `AddCronJob`/`AddCronFunc` build the schedule for you. Every one of them
-has an `AddAdaptiveXxx` counterpart that takes an `AdaptiveJob` instead:
+and `AddCronJob`/`AddCronFunc` build the schedule for you. An `AdaptiveJob`
+can be passed through the same registration methods; the scheduler detects it
+and asks for its next schedule after each execution:
 
 ```go
 // Generic: bring your own Schedule.
@@ -45,12 +46,11 @@ s.AddIntervalFunc(time.Minute, func(ctx context.Context) error { return nil })
 s.AddCronJob("*/5 * * * *", job)
 s.AddCronFunc("*/5 * * * *", func(ctx context.Context) error { return nil })
 
-// Adaptive: the job decides its next Schedule after each run.
-s.AddAdaptiveFunc(schedule, func(ctx context.Context) (scheduler.Schedule, error) { return nil, nil })
-s.AddAdaptiveIntervalJob(time.Minute, adaptiveJob)
-s.AddAdaptiveIntervalFunc(time.Minute, func(ctx context.Context) (scheduler.Schedule, error) { return nil, nil })
-s.AddAdaptiveCronJob("*/5 * * * *", adaptiveJob)
-s.AddAdaptiveCronFunc("*/5 * * * *", func(ctx context.Context) (scheduler.Schedule, error) { return nil, nil })
+// Adaptive: use the regular registration methods. The scheduler detects
+// AdaptiveJob and asks it for the next Schedule after Run returns.
+s.Add(schedule, adaptiveJob)
+s.AddIntervalJob(time.Minute, adaptiveJob)
+s.AddCronJob("*/5 * * * *", adaptiveJob)
 ```
 
 ## Adaptive schedules
@@ -58,20 +58,48 @@ s.AddAdaptiveCronFunc("*/5 * * * *", func(ctx context.Context) (scheduler.Schedu
 Not every job runs on a fixed cadence. A poll loop driven by a server
 response — a chat API's `PollingIntervalMillis`, a rate-limited endpoint's
 retry hint — needs to pick its own next execution after it runs, not before.
-`AdaptiveJob` covers that case without touching the plain `Job` contract:
+`AdaptiveJob` covers that case without changing the plain `Job` contract:
 
 ```go
-_, err := s.AddAdaptiveIntervalFunc(2*time.Second, func(ctx context.Context) (scheduler.Schedule, error) {
+type pollJob struct {
+	delay time.Duration
+}
+
+func (j *pollJob) Run(ctx context.Context) error {
 	delay, err := poll(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return scheduler.NewIntervalSchedule(delay)
-})
+
+	j.delay = delay
+	return nil
+}
+
+func (j *pollJob) NextSchedule(current scheduler.Schedule) (scheduler.Schedule, error) {
+	if j.delay <= 0 {
+		return nil, nil // keep the current schedule
+	}
+
+	return scheduler.NewIntervalSchedule(j.delay)
+}
+
+job := &pollJob{}
+schedule, err := scheduler.NewIntervalSchedule(2 * time.Second)
+if err != nil {
+	return err
+}
+
+_, err = s.Add(schedule, job)
 ```
 
-Returning `nil` keeps the current schedule. A plain `Job` passed to `Add` is
-wrapped internally, so `Add` accepts either kind through the same call.
+The scheduler calls `Run(ctx)` and then `NextSchedule(current)`. Returning
+`nil, nil` keeps the current schedule; returning a schedule replaces it for
+the next execution. An error reports that the replacement could not be
+calculated. The `current` argument is available to stateful schedules that
+need to inspect the existing schedule before producing a replacement.
+
+A plain `Job` passed to `Add` is wrapped internally, so both job kinds use the
+same registration API.
 
 ## Lifecycle, policies, and runtime control
 
@@ -100,6 +128,19 @@ A registration whose `Schedule` stops advancing does not take the rest of
 the scheduler down with it. It freezes in place, fires `OnFailure`, and
 stays out of consideration until `Remove` is called explicitly;
 `FrozenIDs()` reports which registrations are stuck.
+
+## Version 0.2.0
+
+Version `0.2.0` replaces the invalid `0.1.0` adaptive contract. Adaptive jobs
+must implement both `Job.Run` and:
+
+```go
+NextSchedule(current Schedule) (Schedule, error)
+```
+
+The old `RunAdaptive(context.Context)` contract and `AdaptiveJobFunc` adapter
+are removed. Adaptive jobs must be implemented as stateful types that satisfy
+both methods above; registration uses the regular `AddXxx` methods.
 
 ## Example
 

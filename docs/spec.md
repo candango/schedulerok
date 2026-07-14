@@ -1,7 +1,6 @@
 # Scheduler Core API Specification
 
-> **Status:** Core API implemented. Reliability policies and adaptive polling
-> remain follow-up work.
+> **Status:** Core API implemented for `0.2.0`, including adaptive schedules.
 
 ## Scope
 
@@ -18,6 +17,11 @@ type Job interface {
 
 type Schedule interface {
 	Next(after time.Time) time.Time
+}
+
+type AdaptiveJob interface {
+	Job
+	NextSchedule(current Schedule) (Schedule, error)
 }
 ```
 
@@ -89,6 +93,16 @@ scheduler.AddIntervalFunc(interval, fn)
 could mean a timeout or execution length. These methods return the same
 registration ID as `Add`.
 
+An `AdaptiveJob` uses the same registration methods as a plain `Job`. After
+each execution attempt, the scheduler calls `NextSchedule(current Schedule)`;
+only the schedule returned by the final attempt is applied. A nil schedule
+preserves the current schedule; a non-nil schedule replaces it. An error reports
+that the replacement could not be calculated. The current schedule is passed to
+support stateful schedule implementations.
+
+The former `RunAdaptive` and `AdaptiveJobFunc` contracts are removed in
+`0.2.0`; adaptive jobs must implement `Run` and `NextSchedule` separately.
+
 Cron parsing remains owned by `intervalok`; a cron convenience method delegates
 to that parser and then calls `Add`. The generic `Add` API remains independent
 of any cron parser.
@@ -130,13 +144,40 @@ There is no public `Runner`, `Task`, `Manager`, `Entry`, or `Orchestrator` in
 the core API at this stage. Private runtime state may associate a job ID with a
 schedule and job, but that implementation detail is not part of the API.
 
-## Adaptive polling
+## Adaptive scheduling
 
-A long-lived loop that resets its own timer, such as the current YouTube chat
-collector, is a service rather than a scheduled `Job`: it should run alongside
-the scheduler and participate in application shutdown.
+An adaptive job performs one bounded unit of work in `Run` and can return a
+replacement schedule through `NextSchedule(current Schedule)`:
 
-A future adaptive-polling extension may execute one poll, receive a delay from
-the remote service, and let the scheduler arm the next timer with its own
-clock. This is deliberately out of the initial core; it must not be modeled by
-stateful cron schedules or by a job that never returns.
+```go
+type PollJob struct {
+	delay time.Duration
+}
+
+func (j *PollJob) Run(ctx context.Context) error {
+	delay, err := poll(ctx)
+	if err != nil {
+		return err
+	}
+
+	j.delay = delay
+	return nil
+}
+
+func (j *PollJob) NextSchedule(current Schedule) (Schedule, error) {
+	if j.delay <= 0 {
+		return nil, nil
+	}
+
+	return NewIntervalSchedule(j.delay)
+}
+```
+
+Returning `nil, nil` preserves the current schedule. Returning a schedule
+replaces it for the next execution. Returning an error reports a failed
+schedule adaptation. The scheduler remains responsible for applying the
+replacement and validating that it advances into the future.
+
+A long-lived loop that never returns is still a service rather than a
+scheduled `Job`; it should run alongside the scheduler and participate in
+application shutdown.

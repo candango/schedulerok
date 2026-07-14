@@ -519,12 +519,72 @@ func TestSchedulerAddConcurrentDuringRun(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+type adaptiveTestJob struct {
+	run     func(context.Context) error
+	next    func(Schedule) (Schedule, error)
+	current Schedule
+}
+
+func (j *adaptiveTestJob) Run(ctx context.Context) error {
+	return j.run(ctx)
+}
+
+func (j *adaptiveTestJob) NextSchedule(current Schedule) (Schedule, error) {
+	j.current = current
+	return j.next(current)
+}
+
+type adaptiveFuncTestJob struct {
+	fn       func(context.Context) (Schedule, error)
+	schedule Schedule
+}
+
+func (j *adaptiveFuncTestJob) Run(ctx context.Context) error {
+	var err error
+	j.schedule, err = j.fn(ctx)
+	return err
+}
+
+func (j *adaptiveFuncTestJob) NextSchedule(Schedule) (Schedule, error) {
+	return j.schedule, nil
+}
+
+func newAdaptiveFuncTestJob(fn func(context.Context) (Schedule, error)) Job {
+	return &adaptiveFuncTestJob{fn: fn}
+}
+
+func addAdaptiveIntervalTestJob(
+	scheduler *Scheduler,
+	interval time.Duration,
+	fn func(context.Context) (Schedule, error),
+	options ...RegistrationOption,
+) (JobID, error) {
+	schedule, err := NewIntervalSchedule(interval)
+	if err != nil {
+		return "", err
+	}
+
+	return scheduler.Add(schedule, &adaptiveFuncTestJob{fn: fn}, options...)
+}
+
+func TestAdaptiveJobReceivesCurrentSchedule(t *testing.T) {
+	current := IntervalSchedule{interval: time.Minute}
+	job := &adaptiveTestJob{
+		run:  func(context.Context) error { return nil },
+		next: func(Schedule) (Schedule, error) { return nil, nil },
+	}
+
+	_, err := job.NextSchedule(current)
+	require.NoError(t, err)
+	assert.Equal(t, current, job.current)
+}
+
 func TestSchedulerAdaptiveJobAdoptsReturnedSchedule(t *testing.T) {
 	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
 	scheduler := New(WithClock(clock))
 	ran := make(chan struct{}, 1)
 
-	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+	id, err := addAdaptiveIntervalTestJob(scheduler, time.Second, func(context.Context) (Schedule, error) {
 		ran <- struct{}{}
 		return NewIntervalSchedule(5 * time.Second)
 	})
@@ -569,7 +629,7 @@ func TestSchedulerAdaptiveJobNilScheduleKeepsCurrent(t *testing.T) {
 	scheduler := New(WithClock(clock))
 	ran := make(chan struct{}, 2)
 
-	_, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+	_, err := addAdaptiveIntervalTestJob(scheduler, time.Second, func(context.Context) (Schedule, error) {
 		ran <- struct{}{}
 		return nil, nil
 	})
@@ -596,7 +656,7 @@ func TestSchedulerAdaptiveJobInvalidScheduleFreezes(t *testing.T) {
 	scheduler := New(WithClock(clock))
 	failed := make(chan Event, 1)
 
-	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+	id, err := addAdaptiveIntervalTestJob(scheduler, time.Second, func(context.Context) (Schedule, error) {
 		return ScheduleFunc(func(after time.Time) time.Time { return after }), nil
 	}, WithHooks(Hooks{OnFailure: func(_ context.Context, event Event) {
 		failed <- event
@@ -642,7 +702,7 @@ func TestSchedulerAdaptiveJobHonorsScheduleDespiteError(t *testing.T) {
 	failed := make(chan Event, 1)
 	jobErr := errors.New("transient")
 
-	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+	id, err := addAdaptiveIntervalTestJob(scheduler, time.Second, func(context.Context) (Schedule, error) {
 		sched, _ := NewIntervalSchedule(5 * time.Second)
 		return sched, jobErr
 	}, WithHooks(Hooks{OnFailure: func(_ context.Context, event Event) {
@@ -698,7 +758,7 @@ func TestSchedulerAdaptiveJobRetryUsesOnlyFinalAttemptSchedule(t *testing.T) {
 
 	id, err := scheduler.Add(
 		ScheduleFunc(func(after time.Time) time.Time { return after.Add(time.Hour) }),
-		AdaptiveJobFunc(func(context.Context) (Schedule, error) {
+		newAdaptiveFuncTestJob(func(context.Context) (Schedule, error) {
 			if attempts.Add(1) == 1 {
 				return first, errors.New("transient failure")
 			}
@@ -756,7 +816,7 @@ func TestSchedulerAdaptiveJobSkipsRescheduleAfterRemove(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	id, err := scheduler.AddAdaptiveIntervalFunc(time.Second, func(context.Context) (Schedule, error) {
+	id, err := addAdaptiveIntervalTestJob(scheduler, time.Second, func(context.Context) (Schedule, error) {
 		close(started)
 		<-release
 		return NewIntervalSchedule(5 * time.Second)
