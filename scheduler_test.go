@@ -537,15 +537,23 @@ func (j *adaptiveTestJob) NextSchedule(current Schedule) (Schedule, error) {
 type adaptiveFuncTestJob struct {
 	fn       func(context.Context) (Schedule, error)
 	schedule Schedule
+	mu       sync.Mutex
 }
 
 func (j *adaptiveFuncTestJob) Run(ctx context.Context) error {
-	var err error
-	j.schedule, err = j.fn(ctx)
+	schedule, err := j.fn(ctx)
+
+	j.mu.Lock()
+	j.schedule = schedule
+	j.mu.Unlock()
+
 	return err
 }
 
 func (j *adaptiveFuncTestJob) NextSchedule(Schedule) (Schedule, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
 	return j.schedule, nil
 }
 
