@@ -3,7 +3,7 @@ module github.com/candango/schedulerok
 go 1.25
 
 require (
-	github.com/candango/intervalok v0.0.1
+	github.com/candango/intervalok v0.0.2
 	github.com/stretchr/testify v1.11.1
 )
 
