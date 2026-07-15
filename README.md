@@ -145,6 +145,13 @@ the scheduler down with it. It freezes in place, fires `OnFailure`, and
 stays out of consideration until `Remove` is called explicitly;
 `FrozenIDs()` reports which registrations are stuck.
 
+Scheduler-level observability is separate from per-job hooks. Configure
+`WithSchedulerHooks` to receive lifecycle callbacks and optional tick events
+with the tick time, the `JobID`s that were due, and the `JobID`s actually
+dispatched. With tick observation disabled, the scheduler does not allocate
+tick events or job ID slices, keeping the normal path close to zero overhead.
+Callbacks must be fast and non-blocking.
+
 ## Example
 
 Run the basic interval scheduler and stop it with `Ctrl+C`:
@@ -164,7 +171,7 @@ hooks, and graceful shutdown. Output identifies its source:
 
 ## Requirements
 
-- Go 1.24.6 or later
+- Go 1.25 or later
 
 ## Support
 

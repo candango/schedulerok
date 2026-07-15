@@ -36,7 +36,11 @@ type Scheduler struct {
 	registrations map[JobID]*registration
 	nextID        uint64
 	running       bool
+	stopping      bool
+	stop          chan struct{}
+	done          chan struct{}
 	wake          chan struct{}
+	hooks         SchedulerHooks
 }
 
 type registration struct {
@@ -256,8 +260,9 @@ func (s *Scheduler) AddCronFunc(
 	return s.AddCronJob(spec, fn, options...)
 }
 
-// Run starts the scheduler and blocks until ctx is cancelled. New job runs stop
-// when cancellation begins; jobs already running receive ctx and are awaited.
+// Run starts the scheduler and blocks until ctx is cancelled or Stop is
+// called. Context cancellation is propagated to active jobs; Stop waits for
+// active jobs without cancelling them.
 func (s *Scheduler) Run(ctx context.Context) error {
 	if ctx == nil {
 		return ErrNilContext
@@ -272,27 +277,47 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	now := s.clock.Now()
 	for _, registration := range s.registrations {
 		registration.next = registration.schedule.Next(now)
+		registration.frozen = false
 		if !registration.next.After(now) {
 			s.mu.Unlock()
 			return ErrInvalidSchedule
 		}
 	}
 	s.running = true
+	s.stopping = false
+	s.stop = make(chan struct{})
+	s.done = make(chan struct{})
+	stop := s.stop
+	done := s.done
+	hooks := s.hooks
 	s.mu.Unlock()
 
-	defer func() {
-		s.mu.Lock()
-		s.running = false
-		s.mu.Unlock()
-	}()
+	if hooks.OnStart != nil {
+		hooks.OnStart(ctx)
+	}
 
 	var jobs sync.WaitGroup
+	defer func() {
+		jobs.Wait()
+		s.mu.Lock()
+		s.running = false
+		s.stopping = false
+		s.stop = nil
+		s.done = nil
+		s.mu.Unlock()
+		if hooks.OnStopped != nil {
+			hooks.OnStopped(ctx)
+		}
+		close(done)
+	}()
+
 	for {
 		next, ok := s.nextRun()
 		if !ok {
 			select {
 			case <-ctx.Done():
-				jobs.Wait()
+				return nil
+			case <-stop:
 				return nil
 			case <-s.wake:
 				continue
@@ -308,7 +333,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			jobs.Wait()
+			return nil
+		case <-stop:
+			timer.Stop()
 			return nil
 		case <-s.wake:
 			timer.Stop()
@@ -318,6 +345,44 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}
 
 		s.runDue(ctx, now, &jobs)
+	}
+}
+
+// Stop gracefully stops the scheduler. New jobs are not dispatched, active
+// jobs are allowed to finish, and the scheduler can be started again with
+// Run. The context controls how long the caller waits for shutdown.
+func (s *Scheduler) Stop(ctx context.Context) error {
+	if ctx == nil {
+		return ErrNilContext
+	}
+
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		return nil
+	}
+
+	stop := s.stop
+	done := s.done
+	first := !s.stopping
+	if first {
+		s.stopping = true
+	}
+	hooks := s.hooks
+	s.mu.Unlock()
+
+	if first {
+		close(stop)
+		if hooks.OnStopping != nil {
+			hooks.OnStopping(ctx)
+		}
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -342,6 +407,11 @@ func (s *Scheduler) nextRun() (time.Time, bool) {
 // instead of stopping the scheduler for every other registration.
 func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGroup) {
 	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return
+	}
+
 	var due []*registration
 	var skipped []*registration
 	var invalid []*registration
@@ -365,6 +435,11 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 		}
 		due = append(due, registration)
 	}
+	hook := s.hooks.OnTick
+	for _, registration := range due {
+		jobs.Add(1)
+		go s.runJob(ctx, registration, jobs)
+	}
 	s.mu.Unlock()
 
 	for _, registration := range invalid {
@@ -374,9 +449,25 @@ func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGr
 	for _, registration := range skipped {
 		registration.callHook(ctx, registration.hooks.OnSkip, Event{JobID: registration.id})
 	}
-	for _, registration := range due {
-		jobs.Add(1)
-		go s.runJob(ctx, registration, jobs)
+	if hook != nil {
+		dueJobs := make([]JobID, 0, len(due)+len(skipped)+len(invalid))
+		for _, registration := range due {
+			dueJobs = append(dueJobs, registration.id)
+		}
+		for _, registration := range skipped {
+			dueJobs = append(dueJobs, registration.id)
+		}
+		for _, registration := range invalid {
+			dueJobs = append(dueJobs, registration.id)
+		}
+		sort.Slice(dueJobs, func(i, j int) bool { return dueJobs[i] < dueJobs[j] })
+
+		dispatched := make([]JobID, 0, len(due))
+		for _, registration := range due {
+			dispatched = append(dispatched, registration.id)
+		}
+		sort.Slice(dispatched, func(i, j int) bool { return dispatched[i] < dispatched[j] })
+		hook(ctx, TickEvent{At: now, DueJobs: dueJobs, Dispatched: dispatched})
 	}
 }
 

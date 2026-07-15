@@ -135,6 +135,24 @@ the previous run is still active.
 `Event` with the job ID, attempt, failure error, and retry delay when relevant.
 Hooks must return promptly and do not choose a logging or metrics dependency.
 
+Scheduler-level hooks observe the coordinator lifecycle separately from
+per-registration hooks. The `OnTick` event exposes the tick time, the
+registrations due at that tick, and the registrations actually dispatched:
+
+```go
+type TickEvent struct {
+    At         time.Time
+    DueJobs    []JobID
+    Dispatched []JobID
+}
+```
+
+Tick observability is opt-in. When no `OnTick` callback is configured, the
+scheduler must not allocate a `TickEvent` or job ID slices. Callback execution
+must remain fast and must not block the scheduler loop or run while holding
+scheduler locks. The cost when enabled is proportional to tick frequency and
+the number of observed jobs.
+
 ## Lifecycle
 
 `Scheduler` is the public coordinator. It owns multiple registered jobs,
@@ -183,3 +201,10 @@ replacement and validating that it advances into the future.
 A long-lived loop that never returns is still a service rather than a
 scheduled `Job`; it should run alongside the scheduler and participate in
 application shutdown.
+
+## Scheduler observability
+
+Scheduler-level lifecycle callbacks are distinct from per-registration hooks.
+`SchedulerHooks` covers scheduler start, stopping, and stopped states, plus
+`OnTick` for timer ticks. A tick reports `DueJobs` and `Dispatched` job IDs so
+applications can observe the scheduler without exposing private registrations.

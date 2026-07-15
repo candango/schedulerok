@@ -923,3 +923,113 @@ func TestSchedulerAddCronFuncRejectsInvalidExpression(t *testing.T) {
 	})
 	assert.Error(t, err)
 }
+
+func TestSchedulerStopWaitsForActiveJobsAndCanRestart(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var runs atomic.Int32
+
+	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		if runs.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	firstCtx := context.Background()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- scheduler.Run(firstCtx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	<-started
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- scheduler.Stop(context.Background()) }()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned before active job completed: %v", err)
+	default:
+	}
+
+	close(release)
+	assert.NoError(t, <-stopped)
+	assert.Equal(t, int32(1), runs.Load())
+	for {
+		select {
+		case <-clock.timerAdded:
+		default:
+			goto drainedTimers
+		}
+	}
+
+drainedTimers:
+	secondCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- scheduler.Run(secondCtx) }()
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+	assert.Eventually(t, func() bool { return runs.Load() == 2 }, time.Second, time.Millisecond)
+	cancel()
+	assert.NoError(t, <-secondDone)
+	assert.NoError(t, <-firstDone)
+}
+
+func TestSchedulerStopDoesNotDispatchNewJobs(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	var runs atomic.Int32
+
+	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		runs.Add(1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+	assert.NoError(t, scheduler.Stop(context.Background()))
+	clock.Advance(time.Second)
+	assert.Equal(t, int32(0), runs.Load())
+	assert.NoError(t, <-done)
+}
+
+func TestSchedulerHooksObserveLifecycleAndTicks(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	events := make(chan string, 4)
+	ticks := make(chan TickEvent, 1)
+	scheduler := New(
+		WithClock(clock),
+		WithSchedulerHooks(SchedulerHooks{
+			OnStart:    func(context.Context) { events <- "start" },
+			OnStopping: func(context.Context) { events <- "stopping" },
+			OnStopped:  func(context.Context) { events <- "stopped" },
+			OnTick:     func(_ context.Context, event TickEvent) { ticks <- event },
+		}),
+	)
+
+	id, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error { return nil })
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(context.Background()) }()
+	assert.Equal(t, "start", <-events)
+	<-clock.timerAdded
+	clock.Advance(time.Second)
+
+	event := <-ticks
+	assert.Equal(t, clock.Now(), event.At)
+	assert.Equal(t, []JobID{id}, event.DueJobs)
+	assert.Equal(t, []JobID{id}, event.Dispatched)
+
+	assert.NoError(t, scheduler.Stop(context.Background()))
+	assert.Equal(t, "stopping", <-events)
+	assert.Equal(t, "stopped", <-events)
+	assert.NoError(t, <-done)
+}

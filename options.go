@@ -5,6 +5,13 @@ import "fmt"
 // Option configures a Scheduler during construction.
 type Option func(*Scheduler)
 
+// WithSchedulerHooks attaches lifecycle hooks to the scheduler.
+func WithSchedulerHooks(hooks SchedulerHooks) Option {
+	return func(s *Scheduler) {
+		s.hooks = hooks
+	}
+}
+
 // WithClock configures the clock used by the scheduler and its timers.
 //
 // The clock must be set before the scheduler starts. Passing a nil clock is a
