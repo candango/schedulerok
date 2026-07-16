@@ -924,6 +924,90 @@ func TestSchedulerAddCronFuncRejectsInvalidExpression(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestSchedulerPauseBlocksDispatchUntilResume(t *testing.T) {
+	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
+	scheduler := New(WithClock(clock))
+	ran := make(chan struct{}, 1)
+
+	_, err := scheduler.AddIntervalFunc(time.Second, func(context.Context) error {
+		ran <- struct{}{}
+		return nil
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+
+	scheduler.Pause()
+	clock.Advance(time.Second)
+	select {
+	case <-ran:
+		t.Fatal("paused scheduler dispatched a job")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	scheduler.Resume()
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("resumed scheduler did not dispatch the due job")
+	}
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSchedulerPausePreservesAdaptiveSchedule(t *testing.T) {
+	start := time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(start)
+	scheduler := New(WithClock(clock))
+	ran := make(chan struct{}, 1)
+	adapted := make(chan struct{}, 1)
+
+	id, err := addAdaptiveIntervalTestJob(scheduler, time.Second, func(context.Context) (Schedule, error) {
+		ran <- struct{}{}
+		return NewIntervalSchedule(5 * time.Second)
+	}, WithHooks(Hooks{OnSuccess: func(context.Context, Event) {
+		adapted <- struct{}{}
+	}}))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	<-clock.timerAdded
+
+	scheduler.Pause()
+	clock.Advance(time.Second)
+	select {
+	case <-ran:
+		t.Fatal("paused adaptive job ran")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	scheduler.Resume()
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("resumed adaptive job did not run")
+	}
+	<-adapted
+	want := clock.Now().Add(5 * time.Second)
+	assert.Eventually(t, func() bool {
+		scheduler.mu.Lock()
+		next := scheduler.registrations[id].next
+		scheduler.mu.Unlock()
+		return next.Equal(want)
+	}, time.Second, time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestSchedulerStopWaitsForActiveJobsAndCanRestart(t *testing.T) {
 	clock := newFakeClock(time.Date(2026, time.July, 11, 12, 0, 0, 0, time.UTC))
 	scheduler := New(WithClock(clock))

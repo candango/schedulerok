@@ -160,6 +160,11 @@ calculates each next execution through `Schedule.Next`, and stops accepting new
 runs when its runtime context is cancelled. It then waits for active jobs to
 finish according to the configured shutdown behavior.
 
+`Pause()` keeps the scheduler loop alive while preventing new dispatches. It
+preserves each registration's current schedule; `Resume()` wakes the loop and
+allows due registrations to dispatch. A paused `AdaptiveJob` does not run or
+call `NextSchedule`, so its latest schedule remains unchanged until resume.
+
 There is no public `Runner`, `Task`, `Manager`, `Entry`, or `Orchestrator` in
 the core API at this stage. Private runtime state may associate a job ID with a
 schedule and job, but that implementation detail is not part of the API.

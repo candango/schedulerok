@@ -140,6 +140,10 @@ s.AddIntervalFunc(time.Minute, job,
 registered or pulled out mid-flight, and the central loop wakes up to react
 immediately instead of waiting for its next tick.
 
+`Pause` and `Resume` control dispatch without destroying the scheduler
+lifecycle. While paused, the loop remains alive but does not run jobs or call
+`AdaptiveJob.NextSchedule`; the latest schedule is preserved until resume.
+
 A registration whose `Schedule` stops advancing does not take the rest of
 the scheduler down with it. It freezes in place, fires `OnFailure`, and
 stays out of consideration until `Remove` is called explicitly;

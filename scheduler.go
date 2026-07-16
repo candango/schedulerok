@@ -37,6 +37,7 @@ type Scheduler struct {
 	nextID        uint64
 	running       bool
 	stopping      bool
+	paused        bool
 	stop          chan struct{}
 	done          chan struct{}
 	wake          chan struct{}
@@ -351,6 +352,35 @@ func (s *Scheduler) Run(ctx context.Context) error {
 // Stop gracefully stops the scheduler. New jobs are not dispatched, active
 // jobs are allowed to finish, and the scheduler can be started again with
 // Run. The context controls how long the caller waits for shutdown.
+// Pause keeps the scheduler loop alive while preventing job dispatches.
+// Existing schedules are preserved and Resume re-evaluates them.
+func (s *Scheduler) Pause() {
+	s.mu.Lock()
+	changed := !s.paused
+	s.paused = true
+	s.mu.Unlock()
+
+	if changed {
+		s.signalWake()
+	}
+}
+
+// Resume allows dispatches again. A schedule that became due while paused is
+// dispatched once, then its normal scheduling policy continues.
+func (s *Scheduler) Resume() {
+	s.mu.Lock()
+	changed := s.paused
+	s.paused = false
+	s.mu.Unlock()
+
+	if changed {
+		s.signalWake()
+	}
+}
+
+// Stop gracefully stops the scheduler. New jobs are not dispatched, active
+// jobs are allowed to finish, and the scheduler can be started again with
+// Run. The context controls how long the caller waits for shutdown.
 func (s *Scheduler) Stop(ctx context.Context) error {
 	if ctx == nil {
 		return ErrNilContext
@@ -386,9 +416,20 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 	}
 }
 
+func (s *Scheduler) signalWake() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Scheduler) nextRun() (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.paused {
+		return time.Time{}, false
+	}
 
 	var next time.Time
 	for _, registration := range s.registrations {
@@ -407,7 +448,7 @@ func (s *Scheduler) nextRun() (time.Time, bool) {
 // instead of stopping the scheduler for every other registration.
 func (s *Scheduler) runDue(ctx context.Context, now time.Time, jobs *sync.WaitGroup) {
 	s.mu.Lock()
-	if s.stopping {
+	if s.stopping || s.paused {
 		s.mu.Unlock()
 		return
 	}
